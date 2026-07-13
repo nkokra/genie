@@ -1,0 +1,23 @@
+# --- Python virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Collected / generated data (regenerate via collect_coinrun_data.py) ---
+data_collection/coinrun_data/
+data_collection/smoke_test/
+*.npz
+*.mp4
+*.gif
+
+# --- OS / editor cruft ---
+.DS_Store
+.idea/
+.vscode/

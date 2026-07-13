@@ -19,8 +19,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 PYTHON_VERSION="3.9.18"
-VENV_DIR="${HERE}/.venv"
+VENV_DIR="${REPO_ROOT}/.venv"
 PROCGEN_FORK="https://github.com/M-RR-J/procgen.git"
 PROCGEN_BRANCH="bugfix/apple-silicon-build"
 
@@ -36,7 +37,10 @@ echo "==> Installing native arm64 build deps via Homebrew"
 brew install cmake glfw qt@5
 
 echo "==> Ensuring Python ${PYTHON_VERSION} is installed via pyenv"
-pyenv versions --bare | grep -qx "${PYTHON_VERSION}" || pyenv install "${PYTHON_VERSION}"
+# -s/--skip-existing: no-op if already installed. Avoids a pipefail+grep -q
+# SIGPIPE pitfall that made the old check spuriously re-run `pyenv install`
+# (which exits non-zero on an existing version) and abort under `set -e`.
+pyenv install -s "${PYTHON_VERSION}"
 
 echo "==> Creating venv at ${VENV_DIR}"
 "$(pyenv root)/versions/${PYTHON_VERSION}/bin/python3" -m venv "${VENV_DIR}"
@@ -48,10 +52,14 @@ echo "==> Building procgen from the Apple Silicon fork (this compiles the game b
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 git clone --branch "${PROCGEN_BRANCH}" --depth 1 "${PROCGEN_FORK}" "${WORKDIR}/procgen"
-pip install "${WORKDIR}/procgen"
+# procgen's build imports gym3 (for its libenv.h C header), but PEP 517 build
+# isolation hides the venv's packages from the build environment. Install gym3
+# first and build with isolation disabled so the build can find it.
+pip install "gym3" "numpy<2"
+pip install --no-build-isolation "${WORKDIR}/procgen"
 
 echo "==> Installing remaining data-collection deps"
-pip install -r "${HERE}/requirements.txt"
+pip install -r "${REPO_ROOT}/requirements.txt"
 
 echo "==> Sanity check: importing procgen and stepping one env"
 python - <<'PY'

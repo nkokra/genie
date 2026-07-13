@@ -1,0 +1,8 @@
+numpy<2            # procgen/gym3 don't support NumPy 2.0
+imageio
+# gym3 pins imageio-ffmpeg<0.4.0, but that old version is incompatible with
+# modern imageio (its ffmpeg writer passes an `audio_path` kwarg 0.3.0 lacks),
+# which breaks all mp4 writing (collect --format mp4 and view_npz.py). We don't
+# use gym3's video-recorder wrapper, so overriding the pin is safe.
+imageio-ffmpeg>=0.5.0
+tqdm
