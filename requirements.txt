@@ -6,3 +6,4 @@ imageio
 # use gym3's video-recorder wrapper, so overriding the pin is safe.
 imageio-ffmpeg>=0.5.0
 tqdm
+torch
