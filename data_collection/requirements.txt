@@ -1,0 +1,4 @@
+numpy<2
+imageio
+imageio-ffmpeg
+tqdm
