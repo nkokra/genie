@@ -51,19 +51,32 @@ def layer_norm(x, eps=1e-4):
     No learnable gain/bias yet - that arrives with step (4)."""
     return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + eps)
 
+def xavier(shape):
+    """Xavier/Glorot-uniform weight as a leaf tensor that requires grad. Good default for
+    linear projections: keeps activation variance stable as signals pass through the stack."""
+    w = torch.empty(shape)
+    nn.init.xavier_uniform_(w)
+    return w.requires_grad_(True)
+
+def small_normal(shape, std=0.02):
+    """Small zero-mean normal init (leaf, requires grad) - the usual choice for additive
+    position embeddings."""
+    w = torch.empty(shape)
+    nn.init.normal_(w, std=std)
+    return w.requires_grad_(True)
+
 def init_st_block(d_model, num_heads):
-    """All weights for one ST-transformer block. Zero placeholders for now; step (4)
-    will turn these into properly-initialized learnable parameters."""
+    """All weights for one ST-transformer block, Xavier-initialized and requiring grad."""
     kq_dim = d_model // num_heads
     v_dim = d_model // num_heads
-    heads = lambda out_dim: [torch.zeros([d_model, out_dim]) for _ in range(num_heads)]
+    heads = lambda out_dim: [xavier([d_model, out_dim]) for _ in range(num_heads)]
     return {
         "Wq_spatial":  heads(kq_dim), "Wk_spatial":  heads(kq_dim), "Wv_spatial":  heads(v_dim),
-        "Wo_spatial":  torch.zeros([d_model, d_model]),
+        "Wo_spatial":  xavier([d_model, d_model]),
         "Wq_temporal": heads(kq_dim), "Wk_temporal": heads(kq_dim), "Wv_temporal": heads(v_dim),
-        "Wo_temporal": torch.zeros([d_model, d_model]),
-        "W_ff1": torch.zeros([d_model, 4 * d_model]),
-        "W_ff2": torch.zeros([4 * d_model, d_model]),
+        "Wo_temporal": xavier([d_model, d_model]),
+        "W_ff1": xavier([d_model, 4 * d_model]),
+        "W_ff2": xavier([4 * d_model, d_model]),
     }
 
 def st_transformer_block(O, params, causal_mask):
@@ -123,12 +136,14 @@ def main():
     d_model = 512
     num_heads = 8
     num_blocks = 8   # Genie's ST-transformer stacks several of these
+    latent_dim = 32
+    codebook_size = 1024
     causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool), diagonal=1)
 
     # Patch embedding (48 -> d_model) plus additive spatial/temporal position embeddings.
-    E = torch.zeros([C * (patch_size ** 2), d_model])
-    spatial_embedding = torch.zeros([1, 1, (H // patch_size) ** 2, d_model])
-    temporal_embedding = torch.zeros([1, context_length, 1, d_model])
+    E = xavier([C * (patch_size ** 2), d_model])
+    spatial_embedding = small_normal([1, 1, (H // patch_size) ** 2, d_model])
+    temporal_embedding = small_normal([1, context_length, 1, d_model])
     O = batch @ E + spatial_embedding + temporal_embedding
 
     # Stack of ST-transformer blocks, each with its own independent weights.
@@ -136,7 +151,49 @@ def main():
     for params in blocks:
         O = st_transformer_block(O, params, causal_mask)
 
+    O = layer_norm(O)
     print("ST-transformer output:", tuple(O.shape))
+
+    # VQ-VAE codebook
+    # Rows must be diverse (nonzero) or every patch collapses onto the same code index.
+    vq_codebook = torch.randn([codebook_size, latent_dim], requires_grad=True)
+    W_latent = xavier([d_model, latent_dim])   # renamed from F: F is torch.nn.functional
+    latents = O @ W_latent                          # [B, T, N, latent_dim]  project d_model -> 32
+    print(latents.shape)
+
+    # Nearest-neighbour quantization
+    flat = latents.reshape(-1, latent_dim)                        # [B*T*N, latent_dim]
+    dists = torch.cdist(flat, vq_codebook)                        # [B*T*N, codebook_size]  pairwise L2
+    indices = dists.argmin(dim=-1).reshape(latents.shape[:-1])    # [B, T, N]  chosen code per patch
+    quantized = vq_codebook[indices]                             # [B, T, N, latent_dim]
+
+    W_dmodel = xavier([latent_dim, d_model])
+    # Straight-through estimator: forward value equals the quantized code, but the gradient
+    # is routed to `latents` (the encoder) as if quantization were the identity. argmin is
+    # non-differentiable, so without this the reconstruction loss can never reach the encoder.
+    # Keep `quantized` (the raw codebook gather) separate for the VQ losses below.
+    quantized_ste = latents + (quantized - latents).detach()
+    O = quantized_ste @ W_dmodel
+    O = O + spatial_embedding + temporal_embedding
+
+    # Decoder
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    O = layer_norm(O)
+    W_final = xavier([d_model, C * (patch_size ** 2)])
+    O = O @ W_final
+
+    recon_loss      = F.mse_loss(O, batch)                     # encoder + decoder (encoder via STE)
+    codebook_loss   = F.mse_loss(quantized, latents.detach())  # pulls codebook -> encoder outputs
+    commitment_loss = F.mse_loss(quantized.detach(), latents)  # pulls encoder -> codebook
+    loss = recon_loss + codebook_loss + 0.8 * commitment_loss
+    print("loss:", loss.item())
+
+    # Smoke test that the graph is differentiable end-to-end (an optimizer.step() goes here).
+    loss.backward()
+    print("grad reached encoder:", W_latent.grad is not None, "| codebook:", vq_codebook.grad is not None)
 
 if __name__ == '__main__':
     main()
