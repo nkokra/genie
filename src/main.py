@@ -5,66 +5,138 @@ import imageio.v2 as imageio
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
+from torch.utils.data import Dataset, DataLoader, RandomSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR  = REPO_ROOT / "data_collection" / "coinrun_data"
+
+class CoinRunWindows(Dataset):
+    """Map-style dataset: one index per level. __getitem__ returns a random
+    `context_length`-frame contiguous window from that level -> [context_length, 256, 48]."""
+    def __init__(self, data, context_length):
+        self.data = data
+        self.context_length = context_length
+
+    def __len__(self):
+        return self.data.shape[0]                        # number of levels
+
+    def __getitem__(self, level_idx):
+        num_frames = self.data.shape[1]
+        start = torch.randint(0, num_frames - self.context_length + 1, (1,)).item()
+        return self.data[level_idx, start:start + self.context_length]
 
 def load_frames(level_mp4: Path) -> np.ndarray:
     with imageio.get_reader(level_mp4) as reader:
         return np.stack([frame for frame in reader]).astype(np.float32)
 
-print("Loading data...")
-level_files = sorted(DATA_DIR.glob("*.mp4"))
-if not level_files:
-    raise FileNotFoundError(f"No level_*.mp4 found under {DATA_DIR}")
+def attention(K, Q, V, O, mask=None):
+    query = O @ Q
+    key = O @ K
+    value = O @ V
+    if mask is None:
+        scores = torch.softmax(((query @ key.transpose(-2, -1)) / (K.shape[-1] ** 0.5)), dim=-1)
+    else:
+        scores = torch.softmax(((query @ key.transpose(-2, -1)).masked_fill(mask, float("-inf")) / (K.shape[-1] ** 0.5)), dim=-1)
+    sublayer = scores @ value
+    return sublayer
 
-# Load the first 10 levels' frames into a numpy array.
-data = torch.from_numpy(np.stack([load_frames(level_files[i]) for i in range(10)]))
-#print(data.shape)
-#print(type(data))
+def multi_head_attention(O, Wq, Wk, Wv, Wo, mask=None):
+    """Run each head's scaled-dot-product attention on the shared input O, concat the
+    per-head outputs along the feature axis, then apply the output projection Wo."""
+    heads = [attention(Wk[i], Wq[i], Wv[i], O, mask=mask) for i in range(len(Wq))]
+    return torch.concat(heads, dim=-1) @ Wo
 
-patch_size = 4
+def layer_norm(x, eps=1e-4):
+    """Normalize each token's feature vector (last dim) to zero mean / unit std.
+    No learnable gain/bias yet - that arrives with step (4)."""
+    return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + eps)
 
-# Patchify each 64x64x3 frame into 256 patches of 4x4x3 = 48 values.
-# reshape splits H and W into (grid, patch); permute groups each patch's pixels
-# together; final reshape flattens to (patches, patch_vector).
-B, T, H, W, C = data.shape
-p = patch_size
-data = (
-    data.reshape(B, T, H // p, p, W // p, p, C)
-        .permute(0, 1, 2, 4, 3, 5, 6)
-        .reshape(B, T, (H // p) * (W // p), p * p * C)
-)
-print("Finished loading and shaping data")
-#print(data.shape)  # [10, 1000, 256, 48]
+def init_st_block(d_model, num_heads):
+    """All weights for one ST-transformer block. Zero placeholders for now; step (4)
+    will turn these into properly-initialized learnable parameters."""
+    kq_dim = d_model // num_heads
+    v_dim = d_model // num_heads
+    heads = lambda out_dim: [torch.zeros([d_model, out_dim]) for _ in range(num_heads)]
+    return {
+        "Wq_spatial":  heads(kq_dim), "Wk_spatial":  heads(kq_dim), "Wv_spatial":  heads(v_dim),
+        "Wo_spatial":  torch.zeros([d_model, d_model]),
+        "Wq_temporal": heads(kq_dim), "Wk_temporal": heads(kq_dim), "Wv_temporal": heads(v_dim),
+        "Wo_temporal": torch.zeros([d_model, d_model]),
+        "W_ff1": torch.zeros([d_model, 4 * d_model]),
+        "W_ff2": torch.zeros([4 * d_model, d_model]),
+    }
 
-embedding_dim = 16 # is this d_model?? Should be 512?
-attention_dim = 8
-causal_mask = torch.triu(torch.ones(1000, 1000, dtype=bool), diagonal=1)
+def st_transformer_block(O, params, causal_mask):
+    """One ST-transformer block: spatial attention -> temporal (causal) attention -> FFN,
+    each wrapped as a pre-norm residual sub-layer:  x = x + sublayer(layer_norm(x))."""
+    # Spatial self-attention: mixes the patches within each frame (no causal mask).
+    O = O + multi_head_attention(
+        layer_norm(O),
+        params["Wq_spatial"], params["Wk_spatial"], params["Wv_spatial"], params["Wo_spatial"],
+    )
+    # Temporal self-attention: mixes across time per patch. Transpose so time is the
+    # attended (second-to-last) axis, then transpose the result back.
+    temporal = multi_head_attention(
+        layer_norm(O).transpose(-3, -2),
+        params["Wq_temporal"], params["Wk_temporal"], params["Wv_temporal"], params["Wo_temporal"],
+        mask=causal_mask,
+    )
+    O = O + temporal.transpose(-3, -2)
+    # Position-wise feed-forward.
+    normed = layer_norm(O)
+    O = O + F.gelu(normed @ params["W_ff1"]) @ params["W_ff2"]
+    return O
 
-E = torch.zeros([C * (patch_size ** 2), embedding_dim])
-K_spatial = torch.zeros([embedding_dim, attention_dim])
-Q_spatial = torch.zeros([embedding_dim, attention_dim])
-V_spatial = torch.zeros([256, embedding_dim])
+def main():
+    print("Loading data...")
+    level_files = sorted(DATA_DIR.glob("*.mp4"))
+    if not level_files:
+        raise FileNotFoundError(f"No level_*.mp4 found under {DATA_DIR}")
 
-K_temp = torch.zeros([embedding_dim, attention_dim])
-Q_temp = torch.zeros([embedding_dim, attention_dim])
-V_temp = torch.zeros([1000, embedding_dim])
+    # Load the first 10 levels' frames into a numpy array.
+    data = torch.from_numpy(np.stack([load_frames(level_files[i]) for i in range(10)]))
 
-spatial_embedding = torch.zeros([1, 1, 256, embedding_dim])
-temporal_embedding = torch.zeros([1, 1000, 1, embedding_dim])
+    patch_size = 4
 
-pixel_embedding = data @ E
-O = pixel_embedding + spatial_embedding + temporal_embedding
+    # Patchify each 64x64x3 frame into 256 patches of 4x4x3 = 48 values.
+    # reshape splits H and W into (grid, patch); permute groups each patch's pixels
+    # together; final reshape flattens to (patches, patch_vector).
+    B, T, H, W, C = data.shape
+    p = patch_size
+    data = (
+        data.reshape(B, T, H // p, p, W // p, p, C)
+            .permute(0, 1, 2, 4, 3, 5, 6)
+            .reshape(B, T, (H // p) * (W // p), p * p * C)
+    )
+    print("Finished loading and shaping data")
 
-query = O @ Q_spatial
-key = O @ K_spatial
-scores = torch.softmax(((query @ key.transpose(-2, -1)) / (attention_dim ** 0.5)), dim=-1)
-O = scores @ V_spatial
+    batch_size = 5
+    context_length = 16   # contiguous frames per sample
 
-query = O.transpose(-3, -2) @ Q_temp
-key = O.transpose(-3, -2) @ K_temp
-scores = torch.softmax(((query @ key.transpose(-2, -1)).masked_fill(causal_mask, float("-inf")) / (attention_dim ** 0.5)), dim=-1)
-O = (scores @ V_temp).transpose(-3, -2)
+    dataset = CoinRunWindows(data, context_length)
+    sampler = RandomSampler(dataset, replacement=True, num_samples=batch_size * 100)
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0)
 
-print(O.shape)
+    batch = next(iter(loader))   # [5, 16, 256, 48]  (for training: `for batch in loader:`)
+    print("Selected a batch of data:", tuple(batch.shape))
+
+    d_model = 512
+    num_heads = 8
+    num_blocks = 8   # Genie's ST-transformer stacks several of these
+    causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool), diagonal=1)
+
+    # Patch embedding (48 -> d_model) plus additive spatial/temporal position embeddings.
+    E = torch.zeros([C * (patch_size ** 2), d_model])
+    spatial_embedding = torch.zeros([1, 1, (H // patch_size) ** 2, d_model])
+    temporal_embedding = torch.zeros([1, context_length, 1, d_model])
+    O = batch @ E + spatial_embedding + temporal_embedding
+
+    # Stack of ST-transformer blocks, each with its own independent weights.
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    print("ST-transformer output:", tuple(O.shape))
+
+if __name__ == '__main__':
+    main()
