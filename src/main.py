@@ -10,6 +10,10 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR  = REPO_ROOT / "data_collection" / "coinrun_data"
 
+# Apple Silicon GPU (Metal) when present, else CPU. All model weights and the batch
+# are created on / moved to this device.
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
 class CoinRunWindows(Dataset):
     """Map-style dataset: one index per level. __getitem__ returns a random
     `context_length`-frame contiguous window from that level -> [context_length, 256, 48]."""
@@ -54,14 +58,14 @@ def layer_norm(x, eps=1e-4):
 def xavier(shape):
     """Xavier/Glorot-uniform weight as a leaf tensor that requires grad. Good default for
     linear projections: keeps activation variance stable as signals pass through the stack."""
-    w = torch.empty(shape)
+    w = torch.empty(shape, device=DEVICE)          # create ON device so it stays a leaf
     nn.init.xavier_uniform_(w)
     return w.requires_grad_(True)
 
 def small_normal(shape, std=0.02):
     """Small zero-mean normal init (leaf, requires grad) - the usual choice for additive
     position embeddings."""
-    w = torch.empty(shape)
+    w = torch.empty(shape, device=DEVICE)          # create ON device so it stays a leaf
     nn.init.normal_(w, std=std)
     return w.requires_grad_(True)
 
@@ -123,22 +127,23 @@ def main():
     )
     print("Finished loading and shaping data")
 
-    batch_size = 5
+    batch_size = 1        # smoke test: activation memory scales linearly with this.
+                          # 5 blew past 16 GB RAM during backward; 1 keeps peak ~3-4 GB.
     context_length = 16   # contiguous frames per sample
 
     dataset = CoinRunWindows(data, context_length)
     sampler = RandomSampler(dataset, replacement=True, num_samples=batch_size * 100)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0)
 
-    batch = next(iter(loader))   # [5, 16, 256, 48]  (for training: `for batch in loader:`)
-    print("Selected a batch of data:", tuple(batch.shape))
+    batch = next(iter(loader)).to(DEVICE)   # [1, 16, 256, 48]  (for training: `for batch in loader:`)
+    print(f"Selected a batch of data: {tuple(batch.shape)} on {batch.device}")
 
     d_model = 512
     num_heads = 8
     num_blocks = 8   # Genie's ST-transformer stacks several of these
     latent_dim = 32
     codebook_size = 1024
-    causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool), diagonal=1)
+    causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool, device=DEVICE), diagonal=1)
 
     # Patch embedding (48 -> d_model) plus additive spatial/temporal position embeddings.
     E = xavier([C * (patch_size ** 2), d_model])
@@ -156,7 +161,7 @@ def main():
 
     # VQ-VAE codebook
     # Rows must be diverse (nonzero) or every patch collapses onto the same code index.
-    vq_codebook = torch.randn([codebook_size, latent_dim], requires_grad=True)
+    vq_codebook = torch.randn([codebook_size, latent_dim], device=DEVICE, requires_grad=True)
     W_latent = xavier([d_model, latent_dim])   # renamed from F: F is torch.nn.functional
     latents = O @ W_latent                          # [B, T, N, latent_dim]  project d_model -> 32
     print(latents.shape)
