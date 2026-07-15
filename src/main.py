@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import numpy as np
 import imageio.v2 as imageio
 
@@ -115,6 +116,21 @@ def patchify(frames, patch_size):
               .reshape(B, T, (H // p) * (W // p), p * p * C)
     )
 
+def unpatchify(patches, patch_size, H, W):
+    """Inverse of patchify. [B, T, (H/p)*(W/p), p*p*C] -> [B, T, H, W, C]."""
+    B, T, _, pv = patches.shape
+    p = patch_size
+    C = pv // (p * p)
+    return (
+        patches.reshape(B, T, H // p, W // p, p, p, C)
+               .permute(0, 1, 2, 4, 3, 5, 6)
+               .reshape(B, T, H, W, C)
+    )
+
+def causal_time_mask(t):
+    """[t, t] boolean upper-triangular mask (True above the diagonal) for causal temporal attention."""
+    return torch.triu(torch.ones(t, t, dtype=bool, device=DEVICE), diagonal=1)
+
 def vq_quantize(latents, codebook):
     """Nearest-neighbour VQ lookup over the last dim. latents [..., d], codebook [K, d]
     -> (indices [...], quantized [..., d]). Works for any number of leading dims."""
@@ -162,19 +178,31 @@ def train_video_tokenizer(data, patch_size):
     vq_codebook = torch.randn([codebook_size, latent_dim], device=DEVICE, requires_grad=True)
 
     def encode(frames):
-        """Raw frames [B,T,H,W,C] -> (token indices [B,T,N], continuous latents [B,T,N,latent_dim])."""
-        O = patchify(frames, patch_size) @ E + spatial_embedding + temporal_embedding
+        """Raw frames [B,T,H,W,C] -> (token indices [B,T,N], continuous latents [B,T,N,latent_dim]).
+        Variable-length in T (<= context_length): slices the temporal position embedding to fit."""
+        T = frames.shape[1]
+        O = patchify(frames, patch_size) @ E + spatial_embedding + temporal_embedding[:, :T]
         for params in enc_blocks:
-            O = st_transformer_block(O, params, causal_mask)
+            O = st_transformer_block(O, params, causal_time_mask(T))
         O = layer_norm(O)
         latents = O @ W_latent                       # [B, T, N, latent_dim]  project d_model -> 32
         indices, _ = vq_quantize(latents, vq_codebook)
         return indices, latents
 
-    # --- decoder weights: only needed for the reconstruction smoke step below ---
+    # --- decoder weights: used by the reconstruction smoke step AND the inference `decode` closure ---
     W_dmodel   = xavier([latent_dim, d_model])
     dec_blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
     W_final    = xavier([d_model, C * (patch_size ** 2)])
+
+    def decode(z_idx):
+        """Token indices [B,T,N] -> reconstructed pixel frames [B,T,H,W,C] (inference; hard-quantized,
+        no straight-through). Variable-length in T (<= context_length)."""
+        T = z_idx.shape[1]
+        O = vq_codebook[z_idx] @ W_dmodel + spatial_embedding + temporal_embedding[:, :T]
+        for params in dec_blocks:
+            O = st_transformer_block(O, params, causal_time_mask(T))
+        O = layer_norm(O) @ W_final                  # [B, T, N, patch_vec]
+        return unpatchify(O, patch_size, H, W)
 
     # --- smoke step: encode a batch, quantize (straight-through), reconstruct, backprop ---
     batch = sample_batch(data, context_length, batch_size)      # raw [B,T,H,W,C]
@@ -195,7 +223,7 @@ def train_video_tokenizer(data, patch_size):
     loss.backward()
     print(f"[tokenizer] tokens {tuple(indices.shape)} | loss {loss.item():.2f} "
           f"| grad encoder={W_latent.grad is not None} codebook={vq_codebook.grad is not None}")
-    return encode
+    return encode, decode
 
 def train_latent_action_model(data, patch_size):
     """Build the latent action model, run one reconstruction smoke step, and RETURN its frozen
@@ -227,10 +255,12 @@ def train_latent_action_model(data, patch_size):
     vq_codebook = torch.randn([codebook_size, latent_dim], device=DEVICE, requires_grad=True)
 
     def infer_actions(frames):
-        """Raw frames [B,T,H,W,C] -> (action indices [B,T], continuous action latents [B,T,latent_dim])."""
-        O = patchify(frames, patch_size) @ E + spatial_embedding + temporal_embedding
+        """Raw frames [B,T,H,W,C] -> (action indices [B,T], continuous action latents [B,T,latent_dim]).
+        Variable-length in T (<= context_length)."""
+        T = frames.shape[1]
+        O = patchify(frames, patch_size) @ E + spatial_embedding + temporal_embedding[:, :T]
         for params in enc_blocks:
-            O = st_transformer_block(O, params, causal_mask)
+            O = st_transformer_block(O, params, causal_time_mask(T))
         O = layer_norm(O)
         latents = O.reshape(O.shape[0], O.shape[1], -1) @ W_latent   # [B, T, latent_dim]  (patches collapsed)
         indices, _ = vq_quantize(latents, vq_codebook)               # [B, T]
@@ -303,9 +333,19 @@ def train_dynamics_model(data, tokenizer, lam, patch_size):
     temporal_embedding = small_normal([1, T, 1, d_model])
     dec_blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
     W_final    = xavier([d_model, codebook_size])
-    dec_mask   = torch.triu(torch.ones(T, T, dtype=bool, device=DEVICE), diagonal=1)   # causal over time
 
-    # --- MaskGIT masking: hide a random fraction of the tokens we predict, then fill them back in ---
+    def dynamics(z_seq, a_seq):
+        """Token indices [B,t,N] (may contain MASK_ID) + action indices [B,t] -> logits [B,t,N,vocab].
+        Variable-length in t (<= context_length). Each frame attends to its own tokens (spatial) and
+        past frames (temporal causal); the action a_seq[:, k] conditions frame k."""
+        t = z_seq.shape[1]
+        O = (token_embed[z_seq] + action_embed[a_seq].unsqueeze(-2)
+             + spatial_embedding + temporal_embedding[:, :t])    # [B, t, N, d_model]
+        for params in dec_blocks:
+            O = st_transformer_block(O, params, causal_time_mask(t))
+        return layer_norm(O) @ W_final                           # [B, t, N, codebook_size]
+
+    # --- MaskGIT masking smoke step: hide a random fraction of the tokens, then fill them back in ---
     # Frame 0 is the always-visible seed (nothing precedes it). Frames 1..T-1 get a per-token Bernoulli
     # mask at rate ~ U(0.5, 1.0); rate=1.0 recovers the fully-blind "predict next frame from scratch" case.
     mask_rate = 0.5 + 0.5 * torch.rand(1, device=DEVICE)
@@ -314,20 +354,118 @@ def train_dynamics_model(data, tokenizer, lam, patch_size):
     z_in = z_idx.clone()
     z_in[mask] = MASK_ID                                     # swap masked tokens for [MASK]
 
-    # Each frame reconstructs its own (partially-masked) tokens from: its VISIBLE tokens (spatial attn),
-    # the PAST frames (temporal causal attn), and the action INTO it (a_idx[t], aligned per-position).
-    O = (token_embed[z_in] + action_embed[a_idx].unsqueeze(-2)
-         + spatial_embedding + temporal_embedding)           # [B, T, N, d_model]
-    for params in dec_blocks:
-        O = st_transformer_block(O, params, dec_mask)
-    logits = layer_norm(O) @ W_final                         # [B, T, N, codebook_size]
-
+    logits = dynamics(z_in, a_idx)                           # [B, T, N, codebook_size]
     # Cross-entropy over ONLY the masked positions (no credit for tokens handed to the model).
     recon_loss = F.cross_entropy(logits[mask], z_idx[mask])
     recon_loss.backward()
     print(f"[dynamics] mask_rate {mask_rate.item():.2f} | masked {int(mask.sum())}/{B*T*N} "
           f"| loss {recon_loss.item():.2f} | grad token_embed={token_embed.grad is not None} "
           f"action_embed={action_embed.grad is not None}")
+    return dynamics
+
+# ==============================================================================================
+# Inference / generation. Consumes the frozen functionals the trainers now expose:
+#   - encode/decode : train_video_tokenizer -> (encode, decode)   frames <-> tokens
+#   - dynamics      : train_dynamics_model  -> dynamics           (z_seq, a_seq) -> logits
+#   - lam           : train_latent_action_model -> infer_actions  frames -> action indices
+# All are variable-length in the time axis (<= context_length). NOTE: these run on UNTRAINED weights
+# until the co-training loop exists, so a rollout is structurally valid but visually meaningless.
+# ==============================================================================================
+
+def gumbel_like(x):
+    """Standard Gumbel(0,1) noise shaped like x. Adding it to log-probs and taking argmax samples
+    from the softmax; scaling it on a confidence controls how random the MaskGIT reveal order is."""
+    u = torch.rand_like(x)
+    return -torch.log(-torch.log(u + 1e-9) + 1e-9)
+
+def maskgit_decode_frame(dynamics, context, action_hist, action, N, vocab, MASK_ID,
+                         num_steps=16, temperature=1.0, choice_temperature=1.0):
+    """Generate ONE new frame's tokens by MaskGIT iterative parallel decoding.
+
+    Start from an all-[MASK] frame and, over `num_steps` rounds (num_steps << N, that's the whole
+    point), progressively commit the highest-confidence predictions until all N tokens are filled.
+    NOTE the key difference from training: here the `context` frames are fully known (clean) and only
+    the new frame is masked — this is the inference regime we discussed.
+
+        context      already-generated frames' tokens    [B, t, N]   (clean)
+        action_hist  actions that produced those frames   [B, t]
+        action       latent action INTO the new frame     [B]         (user/policy chosen)
+        returns      the new frame's token indices         [B, N]
+    """
+    B = context.shape[0]
+    frame   = torch.full((B, N), MASK_ID, device=DEVICE)         # [B, N]  start fully masked
+    unknown = torch.ones((B, N), dtype=bool, device=DEVICE)      # positions still to decide
+
+    for step in range(num_steps):
+        # Assemble the running sequence: clean context + the current (partly-masked) new frame.
+        z_seq = torch.cat([context, frame.unsqueeze(1)], dim=1)        # [B, t+1, N]
+        a_seq = torch.cat([action_hist, action.unsqueeze(1)], dim=1)   # [B, t+1]
+
+        # Run the (frozen) dynamics model; take the logits at the NEW frame's slot.
+        with torch.no_grad():
+            logits = dynamics(z_seq, a_seq)[:, -1]                     # [B, N, vocab]
+
+        # meat #1: sample a token per position, and score its confidence.
+        probs = F.softmax(logits / temperature, dim=-1)               # [B, N, vocab]
+        # Gumbel-max sampling (== sampling from `probs`, but MPS-safe; avoids torch.multinomial).
+        sampled = (torch.log(probs + 1e-9) + gumbel_like(probs)).argmax(dim=-1)   # [B, N]
+        conf = torch.gather(probs, -1, sampled.unsqueeze(-1)).squeeze(-1)         # [B, N] prob of sample
+        # Annealed noise on the confidence randomizes which tokens get committed first (more early on).
+        conf = conf + choice_temperature * (1 - (step + 1) / num_steps) * gumbel_like(conf)
+        # Already-committed positions keep their token and must never be re-masked (+inf confidence).
+        sampled = torch.where(unknown, sampled, frame)
+        conf = torch.where(unknown, conf, torch.full_like(conf, float("inf")))
+
+        # meat #2: cosine schedule — how many tokens to KEEP masked after this round (1 -> 0).
+        ratio = math.cos(math.pi / 2 * (step + 1) / num_steps)
+        n_keep_masked = 0 if step == num_steps - 1 else int(math.floor(N * ratio))
+
+        # meat #3: keep the n_keep_masked LOWEST-confidence positions masked; commit everything else.
+        still_masked = torch.zeros(B, N, dtype=bool, device=DEVICE)
+        if n_keep_masked > 0:
+            _, low_idx = torch.topk(conf, n_keep_masked, dim=-1, largest=False)   # [B, n_keep_masked]
+            still_masked.scatter_(1, low_idx, True)
+        frame = torch.where(still_masked, torch.full_like(sampled, MASK_ID), sampled)
+        unknown = still_masked
+
+    assert not unknown.any(), "some tokens left undecided after MaskGIT decoding"
+    return frame
+
+def generate_rollout(encode, decode, dynamics, lam, prompt_frames, actions,
+                     N, vocab, MASK_ID, context_length=16, num_steps=16):
+    """Autoregressively roll out a playable video: tokenize a prompt, then generate frames one at a
+    time — each conditioned on all prior frames + a chosen latent action — and detokenize to pixels.
+
+        prompt_frames  seed frames (>=1 real frame)          [B, t0, H, W, C]
+        actions        chosen action index per new frame     [B, num_new]   (values in [0, |A|))
+        returns        the full pixel video                  [B, t0+num_new, H, W, C]
+    """
+    num_new = actions.shape[1]
+
+    # 1. Tokenize the prompt; seed the action history for those frames by inferring them with the LAM.
+    #    (The action into the very first frame is meaningless — nothing precedes it — exactly as in
+    #    training, where frame 0 is the always-visible seed.)
+    with torch.no_grad():
+        history, _ = encode(prompt_frames)        # [B, t0, N]  all frame tokens so far
+        action_hist, _ = lam(prompt_frames)       # [B, t0]     inferred seed actions
+
+    # 2. Generate frames one at a time, growing the running token history.
+    for i in range(num_new):
+        # The dynamics model spans at most context_length frames (incl. the new one), so condition on
+        # at most the last context_length-1 frames (a sliding window for rollouts longer than that).
+        ctx  = history[:, -(context_length - 1):]
+        acts = action_hist[:, -(context_length - 1):]
+        new_frame = maskgit_decode_frame(dynamics, ctx, acts, actions[:, i],
+                                         N, vocab, MASK_ID, num_steps)            # [B, N]
+        history     = torch.cat([history, new_frame.unsqueeze(1)], dim=1)
+        action_hist = torch.cat([action_hist, actions[:, i:i + 1]], dim=1)
+
+    # 3. Detokenize the whole rollout back to pixels, in <=context_length chunks (the decoder's
+    #    temporal position embedding only spans that many frames).
+    with torch.no_grad():
+        chunks = [decode(history[:, s:s + context_length])
+                  for s in range(0, history.shape[1], context_length)]
+    return torch.cat(chunks, dim=1)               # [B, t0+num_new, H, W, C]
 
 def main():
     print("Loading data...")
@@ -338,9 +476,18 @@ def main():
     # Load the first 10 levels' frames into a raw tensor [levels, frames, H, W, C].
     data = torch.from_numpy(np.stack([load_frames(level_files[i]) for i in range(10)]))
 
-    tokenizer = train_video_tokenizer(data, patch_size=4)
+    encode, decode = train_video_tokenizer(data, patch_size=4)
     lam = train_latent_action_model(data, patch_size=16)
-    train_dynamics_model(data, tokenizer, lam, patch_size=16)
+    dynamics = train_dynamics_model(data, encode, lam, patch_size=16)
+
+    # Inference demo: seed with a few real frames, generate a couple more from chosen latent actions,
+    # detokenize to pixels. Untrained weights -> the video is garbage; this just exercises the path.
+    N, vocab, action_vocab, MASK_ID = 256, 1024, 6, 1024   # must match tokenizer/LAM/dynamics configs
+    prompt = sample_batch(data, context_length=16, batch_size=1)[:, :4]     # 4-frame seed
+    actions = torch.randint(0, action_vocab, (prompt.shape[0], 2), device=DEVICE)  # 2 chosen actions
+    video = generate_rollout(encode, decode, dynamics, lam, prompt, actions,
+                             N, vocab, MASK_ID, context_length=16, num_steps=6)
+    print(f"[generate] rollout video {tuple(video.shape)}")
 
 if __name__ == '__main__':
     main()
