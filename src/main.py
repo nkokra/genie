@@ -266,24 +266,54 @@ def train_latent_action_model(data, patch_size):
     return infer_actions
 
 def train_dynamics_model(data, tokenizer, lam, patch_size):
-    """Dynamics model (MaskGIT-style, Section 3.3). `tokenizer` and `lam` are the frozen
-    functionals returned by the two trainers above:
-        tokenizer(frames) -> (z [B,T,N], _)   frame tokens to predict
-        lam(frames)       -> (a [B,T],   _)   per-timestep latent actions to condition on
-    Both take RAW frames, so no patchifying is needed here (`patch_size` is reserved for the
-    dynamics model you're about to build)."""
+    """Dynamics model (MaskGIT-style, Section 3.3) — network architecture only; MaskGIT token
+    masking is not wired up yet. `tokenizer` and `lam` are the frozen functionals from the two
+    trainers; we consume only their DISCRETE outputs (token / action indices) and embed them with
+    this model's OWN learned tables, so the dynamics model is self-contained: at generation time it
+    embeds indices it produced itself, with no access to the tokenizer's continuous latents.
+
+        tokenizer(frames) -> (z_idx [B,T,N], _)
+        lam(frames)       -> (a_idx [B,T],   _)
+    """
     context_length = 16
+    num_blocks = 12
+    d_model = 512
+    num_heads = 8
+    codebook_size = 1024    # frame-token vocab — must match the tokenizer's codebook_size
+    action_vocab  = 6       # latent-action vocab — must match the LAM's codebook_size (|A|)
+    MASK_ID = codebook_size  # reserved last row of token_embed for the [MASK] token (unused until masking)
+
     batch = sample_batch(data, context_length, batch_size=1)    # raw [B,T,H,W,C]
 
-    # Tokenizer and LAM are pre-trained / frozen here: no grad flows back into them.
+    # Tokenizer and LAM are frozen: we only read integer indices (argmin is non-differentiable).
     with torch.no_grad():
-        z, _ = tokenizer(batch)     # frame tokens    [B, T, N]  ints in [0, tokenizer codebook)
-        a, _ = lam(batch)           # latent actions  [B, T]     ints in [0, |A|)
-    print(f"[dynamics] frame tokens {tuple(z.shape)} | actions {tuple(a.shape)}")
+        z_idx, _ = tokenizer(batch)     # frame tokens    [B, T, N]  ints in [0, codebook_size)
+        a_idx, _ = lam(batch)           # latent actions  [B, T]     ints in [0, action_vocab)
+    print(f"[dynamics] frame tokens {tuple(z_idx.shape)} | actions {tuple(a_idx.shape)}")
 
-    # TODO(dynamics): MaskGIT transformer over z conditioned on a. Predict z[:, t+1] from
-    #   z[:, :t+1] (causal in time) and action a[:, t+1]; randomly mask a fraction of the z
-    #   tokens and train cross-entropy over the tokenizer vocabulary to fill them back in.
+    # --- dynamics model weights ---
+    # token_embed has one EXTRA row (index MASK_ID) reserved for the MaskGIT [MASK] token; to mask a
+    # position you'll set z_idx there to MASK_ID before the lookup. W_final predicts real tokens only.
+    token_embed  = small_normal([codebook_size + 1, d_model])
+    action_embed = small_normal([action_vocab, d_model])
+    dec_blocks   = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    W_final      = xavier([d_model, codebook_size])
+    dec_mask     = torch.triu(torch.ones(context_length - 1, context_length - 1, dtype=bool, device=DEVICE), diagonal=1)
+
+    # Predict frame t+1 from frames <=t (causal), conditioned on the action INTO t+1. Same offset as
+    # the LAM decoder: context z_idx[:, :-1] + actions a_idx[:, 1:] -> targets z_idx[:, 1:].
+    O = token_embed[z_idx[:, :-1]] + action_embed[a_idx[:, 1:]].unsqueeze(-2)   # [B, T-1, N, d_model]
+    for params in dec_blocks:
+        O = st_transformer_block(O, params, dec_mask)
+    logits = layer_norm(O) @ W_final                                            # [B, T-1, N, codebook_size]
+
+    recon_loss = F.cross_entropy(
+        logits.reshape(-1, codebook_size),
+        z_idx[:, 1:].reshape(-1),        # next-frame token indices (Long)
+    )
+    recon_loss.backward()
+    print(f"[dynamics] loss {recon_loss.item():.2f} | grad token_embed={token_embed.grad is not None} "
+          f"action_embed={action_embed.grad is not None}")
 
 def main():
     print("Loading data...")
