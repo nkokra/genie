@@ -266,8 +266,8 @@ def train_latent_action_model(data, patch_size):
     return infer_actions
 
 def train_dynamics_model(data, tokenizer, lam, patch_size):
-    """Dynamics model (MaskGIT-style, Section 3.3) — network architecture only; MaskGIT token
-    masking is not wired up yet. `tokenizer` and `lam` are the frozen functionals from the two
+    """Dynamics model (MaskGIT, Section 3.3): each frame reconstructs its own randomly-masked
+    tokens from its visible tokens + past frames + action. `tokenizer` and `lam` are the frozen
     trainers; we consume only their DISCRETE outputs (token / action indices) and embed them with
     this model's OWN learned tables, so the dynamics model is self-contained: at generation time it
     embeds indices it produced itself, with no access to the tokenizer's continuous latents.
@@ -292,27 +292,41 @@ def train_dynamics_model(data, tokenizer, lam, patch_size):
     print(f"[dynamics] frame tokens {tuple(z_idx.shape)} | actions {tuple(a_idx.shape)}")
 
     # --- dynamics model weights ---
-    # token_embed has one EXTRA row (index MASK_ID) reserved for the MaskGIT [MASK] token; to mask a
-    # position you'll set z_idx there to MASK_ID before the lookup. W_final predicts real tokens only.
+    B, T, N = z_idx.shape
+    # token_embed has one EXTRA row (index MASK_ID) for the [MASK] token: masked positions look up
+    # this row instead of their true token. W_final predicts real tokens only (MASK is never a target).
     token_embed  = small_normal([codebook_size + 1, d_model])
     action_embed = small_normal([action_vocab, d_model])
-    dec_blocks   = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
-    W_final      = xavier([d_model, codebook_size])
-    dec_mask     = torch.triu(torch.ones(context_length - 1, context_length - 1, dtype=bool, device=DEVICE), diagonal=1)
+    # Position embeddings are essential here: every masked slot shares the same [MASK] embedding, so
+    # without these the model can't tell which patch (spatial) or which frame (temporal) it predicts.
+    spatial_embedding  = small_normal([1, 1, N, d_model])
+    temporal_embedding = small_normal([1, T, 1, d_model])
+    dec_blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    W_final    = xavier([d_model, codebook_size])
+    dec_mask   = torch.triu(torch.ones(T, T, dtype=bool, device=DEVICE), diagonal=1)   # causal over time
 
-    # Predict frame t+1 from frames <=t (causal), conditioned on the action INTO t+1. Same offset as
-    # the LAM decoder: context z_idx[:, :-1] + actions a_idx[:, 1:] -> targets z_idx[:, 1:].
-    O = token_embed[z_idx[:, :-1]] + action_embed[a_idx[:, 1:]].unsqueeze(-2)   # [B, T-1, N, d_model]
+    # --- MaskGIT masking: hide a random fraction of the tokens we predict, then fill them back in ---
+    # Frame 0 is the always-visible seed (nothing precedes it). Frames 1..T-1 get a per-token Bernoulli
+    # mask at rate ~ U(0.5, 1.0); rate=1.0 recovers the fully-blind "predict next frame from scratch" case.
+    mask_rate = 0.5 + 0.5 * torch.rand(1, device=DEVICE)
+    mask = torch.rand(B, T, N, device=DEVICE) < mask_rate    # [B,T,N]  True = masked (must be predicted)
+    mask[:, 0] = False                                       # keep the seed frame fully visible
+    z_in = z_idx.clone()
+    z_in[mask] = MASK_ID                                     # swap masked tokens for [MASK]
+
+    # Each frame reconstructs its own (partially-masked) tokens from: its VISIBLE tokens (spatial attn),
+    # the PAST frames (temporal causal attn), and the action INTO it (a_idx[t], aligned per-position).
+    O = (token_embed[z_in] + action_embed[a_idx].unsqueeze(-2)
+         + spatial_embedding + temporal_embedding)           # [B, T, N, d_model]
     for params in dec_blocks:
         O = st_transformer_block(O, params, dec_mask)
-    logits = layer_norm(O) @ W_final                                            # [B, T-1, N, codebook_size]
+    logits = layer_norm(O) @ W_final                         # [B, T, N, codebook_size]
 
-    recon_loss = F.cross_entropy(
-        logits.reshape(-1, codebook_size),
-        z_idx[:, 1:].reshape(-1),        # next-frame token indices (Long)
-    )
+    # Cross-entropy over ONLY the masked positions (no credit for tokens handed to the model).
+    recon_loss = F.cross_entropy(logits[mask], z_idx[mask])
     recon_loss.backward()
-    print(f"[dynamics] loss {recon_loss.item():.2f} | grad token_embed={token_embed.grad is not None} "
+    print(f"[dynamics] mask_rate {mask_rate.item():.2f} | masked {int(mask.sum())}/{B*T*N} "
+          f"| loss {recon_loss.item():.2f} | grad token_embed={token_embed.grad is not None} "
           f"action_embed={action_embed.grad is not None}")
 
 def main():
