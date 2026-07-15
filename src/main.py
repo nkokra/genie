@@ -104,20 +104,7 @@ def st_transformer_block(O, params, causal_mask):
     O = O + F.gelu(normed @ params["W_ff1"]) @ params["W_ff2"]
     return O
 
-def main():
-    print("Loading data...")
-    level_files = sorted(DATA_DIR.glob("*.mp4"))
-    if not level_files:
-        raise FileNotFoundError(f"No level_*.mp4 found under {DATA_DIR}")
-
-    # Load the first 10 levels' frames into a numpy array.
-    data = torch.from_numpy(np.stack([load_frames(level_files[i]) for i in range(10)]))
-
-    patch_size = 4
-
-    # Patchify each 64x64x3 frame into 256 patches of 4x4x3 = 48 values.
-    # reshape splits H and W into (grid, patch); permute groups each patch's pixels
-    # together; final reshape flattens to (patches, patch_vector).
+def train_video_tokenizer(data, patch_size):
     B, T, H, W, C = data.shape
     p = patch_size
     data = (
@@ -199,6 +186,195 @@ def main():
     # Smoke test that the graph is differentiable end-to-end (an optimizer.step() goes here).
     loss.backward()
     print("grad reached encoder:", W_latent.grad is not None, "| codebook:", vq_codebook.grad is not None)
+
+def train_latent_action_model(data, patch_size):
+    B, T, H, W, C = data.shape
+    p = patch_size
+    data = (
+        data.reshape(B, T, H // p, p, W // p, p, C)
+            .permute(0, 1, 2, 4, 3, 5, 6)
+            .reshape(B, T, (H // p) * (W // p), p * p * C)
+    )
+    print("Finished loading and shaping data")
+
+    batch_size = 1        # smoke test: activation memory scales linearly with this.
+                          # 5 blew past 16 GB RAM during backward; 1 keeps peak ~3-4 GB.
+    context_length = 16   # contiguous frames per sample
+
+    dataset = CoinRunWindows(data, context_length)
+    sampler = RandomSampler(dataset, replacement=True, num_samples=batch_size * 100)
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0)
+
+    batch = next(iter(loader)).to(DEVICE)   # [1, 16, 256, 48]  (for training: `for batch in loader:`)
+    print(f"Selected a batch of data: {tuple(batch.shape)} on {batch.device}")
+
+    d_model = 512
+    num_heads = 8
+    num_blocks = 8   # Genie's ST-transformer stacks several of these
+    latent_dim = 32
+    codebook_size = 6
+    causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool, device=DEVICE), diagonal=1)
+
+    # Patch embedding (48 -> d_model) plus additive spatial/temporal position embeddings.
+    E = xavier([C * (patch_size ** 2), d_model])
+    spatial_embedding = small_normal([1, 1, (H // patch_size) ** 2, d_model])
+    temporal_embedding = small_normal([1, context_length, 1, d_model])
+    O = batch @ E + spatial_embedding + temporal_embedding
+
+    # Stack of ST-transformer blocks, each with its own independent weights.
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    O = layer_norm(O)
+    print("ST-transformer output:", tuple(O.shape))
+
+    # VQ-VAE codebook
+    # Rows must be diverse (nonzero) or every patch collapses onto the same code index.
+    vq_codebook = torch.randn([codebook_size, latent_dim], device=DEVICE, requires_grad=True)
+    W_latent = xavier([O.shape[2] * d_model, latent_dim])   # renamed from F: F is torch.nn.functional
+    latents = O.reshape(O.shape[0], O.shape[1], -1) @ W_latent                          # [B, T, N, latent_dim]  project d_model -> 32
+    print("latents")
+    print(latents.shape)
+
+    # Nearest-neighbour quantization
+    flat = latents.reshape(-1, latent_dim)                        # [B*T, N*latent_dim]
+    dists = torch.cdist(flat, vq_codebook)                        # [B*T, N*codebook_size]  pairwise L2
+    indices = dists.argmin(dim=-1).reshape(latents.shape[:-1])    # [B, T]  chosen code per timestep
+    quantized = vq_codebook[indices]                             # [B, T, N, latent_dim]
+    print(quantized.shape)
+
+    W_dmodel = xavier([latent_dim, d_model])
+    # Straight-through estimator: forward value equals the quantized code, but the gradient
+    # is routed to `latents` (the encoder) as if quantization were the identity. argmin is
+    # non-differentiable, so without this the reconstruction loss can never reach the encoder.
+    # Keep `quantized` (the raw codebook gather) separate for the VQ losses below.
+    latent_actions = latents + (quantized - latents).detach()
+    O = batch[:, :-1, :, :] @ E + spatial_embedding + temporal_embedding[:, :-1, :, :]
+    O = O + (latent_actions[:, 1:, :] @ W_dmodel).unsqueeze(-2)
+
+    # Decoder
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+
+    causal_mask = torch.triu(torch.ones(context_length-1, context_length-1, dtype=bool, device=DEVICE), diagonal=1)
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    O = layer_norm(O)
+    W_final = xavier([d_model, C * (patch_size ** 2)])
+    O = O @ W_final
+
+    recon_loss      = F.mse_loss(O, batch[:, 1:, :, :])                     # encoder + decoder (encoder via STE)
+    codebook_loss   = F.mse_loss(quantized, latents.detach())  # pulls codebook -> encoder outputs
+    commitment_loss = F.mse_loss(quantized.detach(), latents)  # pulls encoder -> codebook
+    loss = recon_loss + codebook_loss + 0.8 * commitment_loss
+    print("loss:", loss.item())
+
+    # Smoke test that the graph is differentiable end-to-end (an optimizer.step() goes here).
+    loss.backward()
+    print("grad reached encoder:", W_latent.grad is not None, "| codebook:", vq_codebook.grad is not None)
+
+def train_dynamics_model(data, tokenizer, lam, patch_size):
+    B, T, H, W, C = data.shape
+    p = patch_size
+    data = (
+        data.reshape(B, T, H // p, p, W // p, p, C)
+            .permute(0, 1, 2, 4, 3, 5, 6)
+            .reshape(B, T, (H // p) * (W // p), p * p * C)
+    )
+    print("Finished loading and shaping data")
+
+    batch_size = 1        # smoke test: activation memory scales linearly with this.
+                          # 5 blew past 16 GB RAM during backward; 1 keeps peak ~3-4 GB.
+    context_length = 16   # contiguous frames per sample
+
+    dataset = CoinRunWindows(data, context_length)
+    sampler = RandomSampler(dataset, replacement=True, num_samples=batch_size * 100)
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0)
+
+    batch = next(iter(loader)).to(DEVICE)   # [1, 16, 256, 48]  (for training: `for batch in loader:`)
+    print(f"Selected a batch of data: {tuple(batch.shape)} on {batch.device}")
+
+    d_model = 512
+    num_heads = 8
+    num_blocks = 8   # Genie's ST-transformer stacks several of these
+    latent_dim = 32
+    codebook_size = 6
+    causal_mask = torch.triu(torch.ones(context_length, context_length, dtype=bool, device=DEVICE), diagonal=1)
+
+    # Patch embedding (48 -> d_model) plus additive spatial/temporal position embeddings.
+    E = xavier([C * (patch_size ** 2), d_model])
+    spatial_embedding = small_normal([1, 1, (H // patch_size) ** 2, d_model])
+    temporal_embedding = small_normal([1, context_length, 1, d_model])
+    O = batch @ E + spatial_embedding + temporal_embedding
+
+    # Stack of ST-transformer blocks, each with its own independent weights.
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    O = layer_norm(O)
+    print("ST-transformer output:", tuple(O.shape))
+
+    # VQ-VAE codebook
+    # Rows must be diverse (nonzero) or every patch collapses onto the same code index.
+    vq_codebook = torch.randn([codebook_size, latent_dim], device=DEVICE, requires_grad=True)
+    W_latent = xavier([O.shape[2] * d_model, latent_dim])   # renamed from F: F is torch.nn.functional
+    latents = O.reshape(O.shape[0], O.shape[1], -1) @ W_latent                          # [B, T, N, latent_dim]  project d_model -> 32
+    print("latents")
+    print(latents.shape)
+
+    # Nearest-neighbour quantization
+    flat = latents.reshape(-1, latent_dim)                        # [B*T, N*latent_dim]
+    dists = torch.cdist(flat, vq_codebook)                        # [B*T, N*codebook_size]  pairwise L2
+    indices = dists.argmin(dim=-1).reshape(latents.shape[:-1])    # [B, T]  chosen code per timestep
+    quantized = vq_codebook[indices]                             # [B, T, N, latent_dim]
+    print(quantized.shape)
+
+    W_dmodel = xavier([latent_dim, d_model])
+    # Straight-through estimator: forward value equals the quantized code, but the gradient
+    # is routed to `latents` (the encoder) as if quantization were the identity. argmin is
+    # non-differentiable, so without this the reconstruction loss can never reach the encoder.
+    # Keep `quantized` (the raw codebook gather) separate for the VQ losses below.
+    latent_actions = latents + (quantized - latents).detach()
+    O = batch[:, :-1, :, :] @ E + spatial_embedding + temporal_embedding[:, :-1, :, :]
+    O = O + (latent_actions[:, 1:, :] @ W_dmodel).unsqueeze(-2)
+
+    # Decoder
+    blocks = [init_st_block(d_model, num_heads) for _ in range(num_blocks)]
+
+    causal_mask = torch.triu(torch.ones(context_length-1, context_length-1, dtype=bool, device=DEVICE), diagonal=1)
+    for params in blocks:
+        O = st_transformer_block(O, params, causal_mask)
+
+    O = layer_norm(O)
+    W_final = xavier([d_model, C * (patch_size ** 2)])
+    O = O @ W_final
+
+    recon_loss      = F.mse_loss(O, batch[:, 1:, :, :])                     # encoder + decoder (encoder via STE)
+    codebook_loss   = F.mse_loss(quantized, latents.detach())  # pulls codebook -> encoder outputs
+    commitment_loss = F.mse_loss(quantized.detach(), latents)  # pulls encoder -> codebook
+    loss = recon_loss + codebook_loss + 0.8 * commitment_loss
+    print("loss:", loss.item())
+
+    # Smoke test that the graph is differentiable end-to-end (an optimizer.step() goes here).
+    loss.backward()
+    print("grad reached encoder:", W_latent.grad is not None, "| codebook:", vq_codebook.grad is not None)
+
+
+
+def main():
+    print("Loading data...")
+    level_files = sorted(DATA_DIR.glob("*.mp4"))
+    if not level_files:
+        raise FileNotFoundError(f"No level_*.mp4 found under {DATA_DIR}")
+
+    # Load the first 10 levels' frames into a numpy array.
+    data = torch.from_numpy(np.stack([load_frames(level_files[i]) for i in range(10)]))
+
+    tokenizer = train_video_tokenizer(data, patch_size=4)
+    lam = train_latent_action_model(data, patch_size=16)
+    train_dynamics_model(data, tokenizer, lam, patch_size=16)
 
 if __name__ == '__main__':
     main()
